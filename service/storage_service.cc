@@ -414,10 +414,6 @@ void storage_service::join_token_ring(int delay) {
             sleep_abortable(std::chrono::seconds(1), _abort_source).get();
         }
         set_mode(mode::JOINING, "schema complete, ready to bootstrap", true);
-        set_mode(mode::JOINING, "waiting for pending range calculation", true);
-        update_pending_ranges("joining").get();
-        set_mode(mode::JOINING, "calculation complete, ready to bootstrap", true);
-        slogger.debug("... got ring + schema info");
 
         auto t = gms::gossiper::clk::now();
         auto tmptr = get_token_metadata_ptr();
@@ -441,7 +437,6 @@ void storage_service::join_token_ring(int delay) {
                 set_mode(mode::JOINING, "waiting for schema information to complete", true);
                 sleep_abortable(std::chrono::seconds(1), _abort_source).get();
             }
-            update_pending_ranges("bootstrapping/leaving nodes while joining").get();
             tmptr = get_token_metadata_ptr();
         }
         slogger.info("Checking bootstrapping/leaving nodes: ok");
@@ -636,11 +631,11 @@ void storage_service::bootstrap() {
       if (!bootstrap_rbno) {
         // When is_repair_based_node_ops_enabled is true, the bootstrap node
         // will use node_ops_cmd to bootstrap, node_ops_cmd will update the pending ranges.
-        slogger.debug("bootstrap: update pending ranges: endpoint={} bootstrap_tokens={}", get_broadcast_address(), _bootstrap_tokens);
+        slogger.debug("bootstrap: endpoint={} bootstrap_tokens={}", get_broadcast_address(), _bootstrap_tokens);
         mutate_token_metadata([this] (mutable_token_metadata_ptr tmptr) {
             auto endpoint = get_broadcast_address();
             tmptr->add_bootstrap_tokens(_bootstrap_tokens, endpoint);
-            return update_pending_ranges(std::move(tmptr), format("bootstrapping node {}", endpoint));
+            return make_ready_future<>();
         }).get();
       }
 
@@ -770,7 +765,6 @@ void storage_service::handle_state_replacing_update_pending_ranges(mutable_token
                 replacing_node, std::current_exception());
     }
     slogger.info("handle_state_replacing: Update pending ranges for replacing node {}", replacing_node);
-    update_pending_ranges(tmptr, format("handle_state_replacing {}", replacing_node)).get();
 }
 
 void storage_service::handle_state_replacing(inet_address replacing_node) {
@@ -831,7 +825,6 @@ void storage_service::handle_state_bootstrap(inet_address endpoint) {
     if (_gossiper.uses_host_id(endpoint)) {
         tmptr->update_host_id(_gossiper.get_host_id(endpoint), endpoint);
     }
-    update_pending_ranges(tmptr, format("handle_state_bootstrap {}", endpoint)).get();
     replicate_to_all_cores(std::move(tmptr)).get();
 }
 
@@ -920,7 +913,6 @@ void storage_service::handle_state_normal(inet_address endpoint) {
     // a race where natural endpoint was updated to contain node A, but A was
     // not yet removed from pending endpoints
     tmptr->update_normal_tokens(owned_tokens, endpoint).get();
-    update_pending_ranges(tmptr, format("handle_state_normal {}", endpoint)).get();
     replicate_to_all_cores(std::move(tmptr)).get();
     tmlock.reset();
 
@@ -986,7 +978,6 @@ void storage_service::handle_state_leaving(inet_address endpoint) {
     // normally
     tmptr->add_leaving_endpoint(endpoint);
 
-    update_pending_ranges(tmptr, format("handle_state_leaving", endpoint)).get();
     replicate_to_all_cores(std::move(tmptr)).get();
 }
 
@@ -1039,11 +1030,11 @@ void storage_service::handle_state_removing(inet_address endpoint, std::vector<s
             std::unordered_set<token> tmp(remove_tokens.begin(), remove_tokens.end());
             excise(std::move(tmp), endpoint, extract_expire_time(pieces));
         } else if (sstring(gms::versioned_value::REMOVING_TOKEN) == state) {
+            slogger.debug("Tokens {} removed manually (endpoint was {})", remove_tokens, endpoint);
             mutate_token_metadata([this, remove_tokens = std::move(remove_tokens), endpoint] (mutable_token_metadata_ptr tmptr) mutable {
-                slogger.debug("Tokens {} removed manually (endpoint was {})", remove_tokens, endpoint);
                 // Note that the endpoint is being removed
                 tmptr->add_leaving_endpoint(endpoint);
-                return update_pending_ranges(std::move(tmptr), format("handle_state_removing {}", endpoint));
+                return make_ready_future<>();
             }).get();
             // find the endpoint coordinating this removal that we need to notify when we're done
             auto* value = _gossiper.get_application_state_ptr(endpoint, application_state::REMOVAL_COORDINATOR);
@@ -1165,7 +1156,6 @@ void storage_service::on_remove(gms::inet_address endpoint) {
     auto tmlock = get_token_metadata_lock().get0();
     auto tmptr = get_mutable_token_metadata_ptr().get0();
     tmptr->remove_endpoint(endpoint);
-    update_pending_ranges(tmptr, format("on_remove {}", endpoint)).get();
     replicate_to_all_cores(std::move(tmptr)).get();
 }
 
@@ -1862,11 +1852,10 @@ future<> storage_service::decommission() {
                 throw std::runtime_error(format("Node in {} state; wait for status to become normal or restart", ss._operation_mode));
             }
 
-            ss.update_pending_ranges(format("decommission {}", endpoint)).get();
-
             auto non_system_keyspaces = db.get_non_system_keyspaces();
             for (const auto& keyspace_name : non_system_keyspaces) {
-                if (ss.get_token_metadata().has_pending_ranges(keyspace_name, ss.get_broadcast_address())) {
+                auto erm = db.find_keyspace(keyspace_name).get_effective_replication_map();
+                if (erm->has_pending_ranges(ss.get_broadcast_address())) {
                     throw std::runtime_error("data is currently moving to this node; unable to leave the ring");
                 }
             }
@@ -2398,21 +2387,23 @@ future<node_ops_cmd_response> storage_service::node_ops_cmd_handler(gms::inet_ad
                 slogger.warn("{}", msg);
                 throw std::runtime_error(msg);
             }
+            slogger.debug("removenode[{}]: adding leaving nodes: {}", req.ops_uuid, req.leaving_nodes);
             mutate_token_metadata([coordinator, &req, this] (mutable_token_metadata_ptr tmptr) mutable {
                 for (auto& node : req.leaving_nodes) {
                     slogger.info("removenode[{}]: Added node={} as leaving node, coordinator={}", req.ops_uuid, node, coordinator);
                     tmptr->add_leaving_endpoint(node);
                 }
-                return update_pending_ranges(tmptr, format("removenode {}", req.leaving_nodes));
+                return make_ready_future<>();
             }).get();
             auto ops = seastar::make_shared<node_ops_info>(node_ops_info{ops_uuid, false, std::move(req.ignore_nodes)});
             auto meta = node_ops_meta_data(ops_uuid, coordinator, std::move(ops), [this, coordinator, req = std::move(req)] () mutable {
+                slogger.debug("removenode[{}]: removing leaving nodes: {}", req.ops_uuid, req.leaving_nodes);
                 return mutate_token_metadata([this, coordinator, req = std::move(req)] (mutable_token_metadata_ptr tmptr) mutable {
                     for (auto& node : req.leaving_nodes) {
                         slogger.info("removenode[{}]: Removed node={} as leaving node, coordinator={}", req.ops_uuid, node, coordinator);
                         tmptr->del_leaving_endpoint(node);
                     }
-                    return update_pending_ranges(tmptr, format("removenode {}", req.leaving_nodes));
+                    return make_ready_future<>();
                 });
             },
             [this, ops_uuid] () mutable { node_ops_singal_abort(ops_uuid); });
@@ -2447,21 +2438,23 @@ future<node_ops_cmd_response> storage_service::node_ops_cmd_handler(gms::inet_ad
                 slogger.warn("{}", msg);
                 throw std::runtime_error(msg);
             }
+            slogger.debug("decommission[{}]: adding leaving nodes: {}", req.ops_uuid, req.leaving_nodes);
             mutate_token_metadata([coordinator, &req, this] (mutable_token_metadata_ptr tmptr) mutable {
                 for (auto& node : req.leaving_nodes) {
                     slogger.info("decommission[{}]: Added node={} as leaving node, coordinator={}", req.ops_uuid, node, coordinator);
                     tmptr->add_leaving_endpoint(node);
                 }
-                return update_pending_ranges(tmptr, format("decommission {}", req.leaving_nodes));
+                return make_ready_future<>();
             }).get();
             auto ops = seastar::make_shared<node_ops_info>(node_ops_info{ops_uuid, false, std::move(req.ignore_nodes)});
             auto meta = node_ops_meta_data(ops_uuid, coordinator, std::move(ops), [this, coordinator, req = std::move(req)] () mutable {
+                slogger.debug("decommission[{}]: removing leaving nodes: {}", req.ops_uuid, req.leaving_nodes);
                 return mutate_token_metadata([this, coordinator, req = std::move(req)] (mutable_token_metadata_ptr tmptr) mutable {
                     for (auto& node : req.leaving_nodes) {
                         slogger.info("decommission[{}]: Removed node={} as leaving node, coordinator={}", req.ops_uuid, node, coordinator);
                         tmptr->del_leaving_endpoint(node);
                     }
-                    return update_pending_ranges(tmptr, format("decommission {}", req.leaving_nodes));
+                    return make_ready_future<>();
                 });
             },
             [this, ops_uuid] () mutable { node_ops_singal_abort(ops_uuid); });
@@ -2487,6 +2480,7 @@ future<node_ops_cmd_response> storage_service::node_ops_cmd_handler(gms::inet_ad
                 slogger.warn("{}", msg);
                 throw std::runtime_error(msg);
             }
+            slogger.debug("replace[{}]: adding replacing_nodes={}", req.ops_uuid, req.replace_nodes);
             mutate_token_metadata([coordinator, &req, this] (mutable_token_metadata_ptr tmptr) mutable {
                 for (auto& x: req.replace_nodes) {
                     auto existing_node = x.first;
@@ -2498,6 +2492,7 @@ future<node_ops_cmd_response> storage_service::node_ops_cmd_handler(gms::inet_ad
             }).get();
             auto ops = seastar::make_shared<node_ops_info>(node_ops_info{ops_uuid, false, std::move(req.ignore_nodes)});
             auto meta = node_ops_meta_data(ops_uuid, coordinator, std::move(ops), [this, coordinator, req = std::move(req)] () mutable {
+                slogger.debug("replace[{}]: removing replacing_nodes={}", req.ops_uuid, req.replace_nodes);
                 return mutate_token_metadata([this, coordinator, req = std::move(req)] (mutable_token_metadata_ptr tmptr) mutable {
                     for (auto& x: req.replace_nodes) {
                         auto existing_node = x.first;
@@ -2505,7 +2500,7 @@ future<node_ops_cmd_response> storage_service::node_ops_cmd_handler(gms::inet_ad
                         slogger.info("replace[{}]: Removed replacing_node={} to replace existing_node={}, coordinator={}", req.ops_uuid, replacing_node, existing_node, coordinator);
                         tmptr->del_replacing_endpoint(existing_node);
                     }
-                    return update_pending_ranges(tmptr, format("replace {}", req.replace_nodes));
+                    return make_ready_future<>();
                 });
             },
             [this, ops_uuid ] { node_ops_singal_abort(ops_uuid); });
@@ -2523,9 +2518,6 @@ future<node_ops_cmd_response> storage_service::node_ops_cmd_handler(gms::inet_ad
         } else if (req.cmd == node_ops_cmd::replace_prepare_pending_ranges) {
             // Update the pending_ranges for the replacing node
             slogger.debug("replace[{}]: Updated pending_ranges from coordinator={}", req.ops_uuid, coordinator);
-            mutate_token_metadata([coordinator, &req, this] (mutable_token_metadata_ptr tmptr) mutable {
-                return update_pending_ranges(tmptr, format("replace {}", req.replace_nodes));
-            }).get();
         } else if (req.cmd == node_ops_cmd::replace_heartbeat) {
             slogger.debug("replace[{}]: Updated heartbeat from coordinator={}", req.ops_uuid, coordinator);
             node_ops_update_heartbeat(ops_uuid);
@@ -2541,6 +2533,7 @@ future<node_ops_cmd_response> storage_service::node_ops_cmd_handler(gms::inet_ad
                 slogger.warn("{}", msg);
                 throw std::runtime_error(msg);
             }
+            slogger.debug("bootstrap[{}]: adding bootstrap_nodes={}", req.ops_uuid, req.bootstrap_nodes);
             mutate_token_metadata([coordinator, &req, this] (mutable_token_metadata_ptr tmptr) mutable {
                 for (auto& x: req.bootstrap_nodes) {
                     auto& endpoint = x.first;
@@ -2548,10 +2541,11 @@ future<node_ops_cmd_response> storage_service::node_ops_cmd_handler(gms::inet_ad
                     slogger.info("bootstrap[{}]: Added node={} as bootstrap, coordinator={}", req.ops_uuid, endpoint, coordinator);
                     tmptr->add_bootstrap_tokens(tokens, endpoint);
                 }
-                return update_pending_ranges(tmptr, format("bootstrap {}", req.bootstrap_nodes));
+                return make_ready_future<>();
             }).get();
             auto ops = seastar::make_shared<node_ops_info>(node_ops_info{ops_uuid, false, std::move(req.ignore_nodes)});
             auto meta = node_ops_meta_data(ops_uuid, coordinator, std::move(ops), [this, coordinator, req = std::move(req)] () mutable {
+                slogger.debug("bootstrap[{}]: removing bootstrap_nodes={}", req.ops_uuid, req.bootstrap_nodes);
                 return mutate_token_metadata([this, coordinator, req = std::move(req)] (mutable_token_metadata_ptr tmptr) mutable {
                     for (auto& x: req.bootstrap_nodes) {
                         auto& endpoint = x.first;
@@ -2559,7 +2553,7 @@ future<node_ops_cmd_response> storage_service::node_ops_cmd_handler(gms::inet_ad
                         slogger.info("bootstrap[{}]: Removed node={} as bootstrap, coordinator={}", req.ops_uuid, endpoint, coordinator);
                         tmptr->remove_bootstrap_tokens(tokens);
                     }
-                    return update_pending_ranges(tmptr, format("bootstrap {}", req.bootstrap_nodes));
+                    return make_ready_future<>();
                 });
             },
             [this, ops_uuid ] { node_ops_singal_abort(ops_uuid); });
@@ -2902,7 +2896,6 @@ void storage_service::excise(std::unordered_set<token> tokens, inet_address endp
     tmptr->remove_endpoint(endpoint);
     tmptr->remove_bootstrap_tokens(tokens);
 
-    update_pending_ranges(tmptr, format("excise {}", endpoint)).get();
     replicate_to_all_cores(std::move(tmptr)).get();
     tmlock.reset();
 
@@ -2961,10 +2954,11 @@ future<> storage_service::confirm_replication(inet_address node) {
 // Runs inside seastar::async context
 void storage_service::leave_ring() {
     db::system_keyspace::set_bootstrap_state(db::system_keyspace::bootstrap_state::NEEDS_BOOTSTRAP).get();
-    mutate_token_metadata([this] (mutable_token_metadata_ptr tmptr) {
-        auto endpoint = get_broadcast_address();
+    auto endpoint = get_broadcast_address();
+    slogger.debug("leave_ring: endpoint={}", endpoint);
+    mutate_token_metadata([this, endpoint] (mutable_token_metadata_ptr tmptr) {
         tmptr->remove_endpoint(endpoint);
-        return update_pending_ranges(std::move(tmptr), format("leave_ring {}", endpoint));
+        return make_ready_future<>();
     }).get();
 
     auto expire_time = _gossiper.compute_expire_time().time_since_epoch().count();
@@ -3004,10 +2998,11 @@ storage_service::stream_ranges(std::unordered_map<sstring, std::unordered_multim
 
 future<> storage_service::start_leaving() {
     return _gossiper.add_local_application_state(application_state::STATUS, versioned_value::leaving(db::system_keyspace::get_local_tokens().get0())).then([this] {
-        return mutate_token_metadata([this] (mutable_token_metadata_ptr tmptr) {
-            auto endpoint = get_broadcast_address();
+        auto endpoint = get_broadcast_address();
+        slogger.debug("start_leaving: endpoint={}", endpoint);
+        return mutate_token_metadata([this, endpoint] (mutable_token_metadata_ptr tmptr) {
             tmptr->add_leaving_endpoint(endpoint);
-            return update_pending_ranges(std::move(tmptr), format("start_leaving {}", endpoint));
+            return make_ready_future<>();
         });
     });
 }
@@ -3177,44 +3172,21 @@ future<> storage_service::mutate_token_metadata(std::function<future<> (mutable_
     co_await replicate_to_all_cores(std::move(tmptr));
 }
 
-future<> storage_service::update_pending_ranges(mutable_token_metadata_ptr tmptr, sstring reason) {
-    assert(this_shard_id() == 0);
-
-    // long start = System.currentTimeMillis();
-    return do_with(_db.local().get_non_system_keyspaces(), [this, tmptr = std::move(tmptr)] (auto& keyspaces) mutable {
-        return do_for_each(keyspaces, [this, tmptr = std::move(tmptr)] (auto& keyspace_name) mutable {
-            auto& ks = this->_db.local().find_keyspace(keyspace_name);
-            auto& strategy = ks.get_replication_strategy();
-            slogger.debug("Updating pending ranges for keyspace={} starts", keyspace_name);
-            return tmptr->update_pending_ranges(strategy, keyspace_name).finally([&keyspace_name] {
-                slogger.debug("Updating pending ranges for keyspace={} ends", keyspace_name);
-            });
-        });
-    }).handle_exception([this, reason = std::move(reason)] (std::exception_ptr ep) mutable {
-        slogger.error("Failed to update pending ranges for {}: {}", reason, ep);
-        return make_exception_future<>(std::move(ep));
-    });
-    // slogger.debug("finished calculation for {} keyspaces in {}ms", keyspaces.size(), System.currentTimeMillis() - start);
-}
-
-future<> storage_service::update_pending_ranges(sstring reason, acquire_merge_lock acquire_merge_lock) {
-    return mutate_token_metadata([this, reason = std::move(reason)] (mutable_token_metadata_ptr tmptr) mutable {
-        return update_pending_ranges(std::move(tmptr), std::move(reason));
-    }, acquire_merge_lock);
-}
-
 future<> storage_service::keyspace_changed(const sstring& ks_name) {
     // Update pending ranges since keyspace can be changed after we calculate pending ranges.
-    sstring reason = format("keyspace {}", ks_name);
-    return container().invoke_on(0, [reason = std::move(reason)] (auto& ss) mutable {
-        return ss.update_pending_ranges(reason, acquire_merge_lock::no).handle_exception([reason = std::move(reason)] (auto ep) {
-            slogger.warn("Failure to update pending ranges for {} ignored", reason);
+    slogger.debug("keyspace {} changed", ks_name);
+    return container().invoke_on(0, [ks_name] (auto& ss) mutable {
+        return ss.mutate_token_metadata([] (mutable_token_metadata_ptr) {
+            return make_ready_future<>();
+        }, acquire_merge_lock::no).handle_exception([ks_name = std::move(ks_name)] (auto ep) {
+            slogger.warn("Failure to update pending ranges for keyspace {} ignored", ks_name);
         });
     });
 }
 
 future<> storage_service::update_topology(inet_address endpoint) {
     return container().invoke_on(0, [endpoint] (auto& ss) {
+        slogger.debug("update_topology: {}", endpoint);
         return ss.mutate_token_metadata([&ss, endpoint] (mutable_token_metadata_ptr tmptr) mutable {
             // re-read local rack and DC info
             tmptr->update_topology(endpoint);
@@ -3547,7 +3519,8 @@ void storage_service::notify_cql_change(inet_address endpoint, bool ready)
 future<bool> storage_service::is_cleanup_allowed(sstring keyspace) {
     return container().invoke_on(0, [keyspace = std::move(keyspace)] (storage_service& ss) {
         auto my_address = ss.get_broadcast_address();
-        auto pending_ranges = ss.get_token_metadata().has_pending_ranges(keyspace, my_address);
+        auto erm = ss._db.local().find_keyspace(keyspace).get_effective_replication_map();
+        auto pending_ranges = erm->has_pending_ranges(my_address);
         bool is_bootstrap_mode = ss._is_bootstrap_mode;
         slogger.debug("is_cleanup_allowed: keyspace={}, is_bootstrap_mode={}, pending_ranges={}",
                 keyspace, is_bootstrap_mode, pending_ranges);
