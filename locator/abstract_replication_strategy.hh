@@ -24,6 +24,12 @@
 #include <memory>
 #include <functional>
 #include <unordered_map>
+
+#include <boost/icl/interval.hpp>
+#include <boost/icl/interval_map.hpp>
+
+#include <seastar/core/coroutine.hh>
+
 #include "gms/inet_address.hh"
 #include "locator/snitch_base.hh"
 #include "dht/i_partitioner.hh"
@@ -122,16 +128,15 @@ public:
     // Note: must be called with initialized, non-empty token_metadata.
     future<dht::token_range_vector> get_ranges(inet_address ep, token_metadata_ptr tmptr) const;
 
-public:
-    future<std::unordered_multimap<inet_address, dht::token_range>> get_address_ranges(const token_metadata& tm) const;
-    future<std::unordered_multimap<inet_address, dht::token_range>> get_address_ranges(const token_metadata& tm, inet_address endpoint) const;
-
     // Caller must ensure that token_metadata will not change throughout the call.
     future<std::unordered_map<dht::token_range, inet_address_vector_replica_set>> get_range_addresses(const token_metadata& tm) const;
 
     future<dht::token_range_vector> get_pending_address_ranges(const token_metadata_ptr tmptr, token pending_token, inet_address pending_address) const;
 
     future<dht::token_range_vector> get_pending_address_ranges(const token_metadata_ptr tmptr, std::unordered_set<token> pending_tokens, inet_address pending_address) const;
+
+private:
+    future<dht::token_range_vector> get_address_ranges(const token_metadata& tm, inet_address endpoint) const;
 };
 
 // Holds the full replication_map resulting from applying the
@@ -160,10 +165,16 @@ public:
     };
 
 private:
+    using address_ranges = std::unordered_map<inet_address, dht::token_range_vector>;
+    using pending_ranges = std::unordered_map<range<token>, std::unordered_set<inet_address>>;
+    using pending_ranges_interval_map = boost::icl::interval_map<token, inet_address_vector_topology_change>;
+
     abstract_replication_strategy::ptr_type _rs;
     token_metadata_ptr _tmptr;
     replication_map _replication_map;
     size_t _replication_factor;
+    pending_ranges_interval_map _pending_ranges_interval_map;
+    std::unordered_set<inet_address> _pending_nodes;
     std::optional<factory_key> _factory_key = std::nullopt;
     effective_replication_map_factory* _factory = nullptr;
 
@@ -227,9 +238,60 @@ public:
     std::unordered_map<dht::token_range, inet_address_vector_replica_set>
     get_range_addresses() const;
 
+    // returns empty vector if token not found.
+    inet_address_vector_topology_change pending_endpoints_for(const token& token) const;
+
+    bool has_pending_ranges(inet_address endpoint) const noexcept;
+
 private:
     dht::token_range_vector do_get_ranges(noncopyable_function<bool(inet_address_vector_replica_set)> should_add_range) const;
 
+    future<address_ranges> calculate_address_ranges() const;
+
+    future<> calculate_pending_ranges_for_replacing(
+        const address_ranges& address_ranges,
+        pending_ranges& new_pending_ranges,
+        const std::unordered_map<inet_address, inet_address>& replacing_endpoints) const;
+    future<> calculate_pending_ranges_for_leaving(
+        const address_ranges& address_ranges,
+        pending_ranges& new_pending_ranges,
+        const token_metadata& all_left_metadata,
+        const std::unordered_set<inet_address>& leaving_endpoints) const;
+    future<> calculate_pending_ranges_for_bootstrap(
+        pending_ranges& new_pending_ranges,
+        token_metadata& all_left_metadata,
+        const std::unordered_map<token, inet_address>& bootstrap_tokens) const;
+
+    future<> set_pending_ranges(pending_ranges new_pending_ranges);
+
+    future<> clear_pending_ranges_gently() noexcept;
+
+     /**
+      * Calculate pending ranges according to bootsrapping and leaving nodes. Reasoning is:
+      *
+      * (1) When in doubt, it is better to write too much to a node than too little. That is, if
+      * there are multiple nodes moving, calculate the biggest ranges a node could have. Cleaning
+      * up unneeded data afterwards is better than missing writes during movement.
+      * (2) When a node leaves, ranges for other nodes can only grow (a node might get additional
+      * ranges, but it will not lose any of its current ranges as a result of a leave). Therefore
+      * we will first remove _all_ leaving tokens for the sake of calculation and then check what
+      * ranges would go where if all nodes are to leave. This way we get the biggest possible
+      * ranges with regard current leave operations, covering all subsets of possible final range
+      * values.
+      * (3) When a node bootstraps, ranges of other nodes can only get smaller. Without doing
+      * complex calculations to see if multiple bootstraps overlap, we simply base calculations
+      * on the same token ring used before (reflecting situation after all leave operations have
+      * completed). Bootstrapping nodes will be added and removed one by one to that metadata and
+      * checked what their ranges would be. This will give us the biggest possible ranges the
+      * node could have. It might be that other bootstraps make our actual final ranges smaller,
+      * but it does not matter as we can clean up the data afterwards.
+      *
+      * NOTE: This is heavy and ineffective operation. This will be done only once when a node
+      * changes state in the cluster, so it should be manageable.
+      */
+    future<> update_pending_ranges();
+
+    friend future<lw_shared_ptr<effective_replication_map>> calculate_effective_replication_map(abstract_replication_strategy::ptr_type rs, token_metadata_ptr tmptr);
 public:
     static factory_key make_factory_key(const abstract_replication_strategy::ptr_type& rs, const token_metadata_ptr& tmptr);
 
@@ -341,6 +403,13 @@ public:
         return _stopped;
     }
 
+    // Note that func is called with a const effective_replication_map&
+    // If it yields, it must keep erm.shared_from_this() to extend its lifetime
+    future<> do_for_each(std::invocable<const effective_replication_map&> auto func) const noexcept {
+        for (const auto& [key, p] : _effective_replication_maps) {
+            co_await futurize_invoke(func, *p);
+        }
+    }
 private:
     effective_replication_map_ptr find_effective_replication_map(const effective_replication_map::factory_key& key) const;
     effective_replication_map_ptr insert_effective_replication_map(mutable_effective_replication_map_ptr erm, effective_replication_map::factory_key key);
